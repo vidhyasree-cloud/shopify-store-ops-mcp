@@ -23,15 +23,30 @@ rank best sellers, and get a one-call store health summary.
 (handmade candles / home goods) — 8 products, 6 orders. Every tool
 result says `mode: "sample"`. Nothing is a real store, customer, or sale.
 
-**LIVE (real store):** set both env vars in the Claude Desktop config:
+**LIVE (real store):** set the store domain plus the app's client
+credentials in the Claude Desktop config — this is the lasting live
+mode, the server fetches a fresh access token itself and refreshes
+it before it expires, so there is no 24-hour token to paste again:
 ```
 SHOPIFY_STORE_DOMAIN = my-store.myshopify.com
-SHOPIFY_ADMIN_ACCESS_TOKEN = <custom-app Admin API token>
+SHOPIFY_CLIENT_ID = <Dev Dashboard app Client ID>
+SHOPIFY_CLIENT_SECRET = <Dev Dashboard app Client Secret>
 ```
 Scopes needed: `read_products`, `read_orders`, `read_inventory`.
-The token lives only in the local config / a private file on the PC —
-never in chat, never in the repo, never in a screenshot. Rotate it if
-it is ever pasted anywhere.
+Since 1 January 2026 new apps are made in the Shopify Dev Dashboard
+— there is no "Reveal token once" in the admin for them. The client
+credentials grant (`POST /admin/oauth/access_token`, grant_type
+`client_credentials`) is how the token is obtained, and it lasts
+about 24 hours (`expires_in: 86399`).
+
+A static token also still works, for a day at a time:
+```
+SHOPIFY_ADMIN_ACCESS_TOKEN = <custom-app Admin API token>
+```
+Client credentials win over a static token when both are set.
+Credentials live only in the local config / a private file on the PC —
+never in chat, never in the repo, never in a screenshot. Rotate them if
+they are ever pasted anywhere.
 
 ## Honest limits
 

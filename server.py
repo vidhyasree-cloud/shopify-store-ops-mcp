@@ -8,11 +8,18 @@ Two modes, always labelled in every tool result:
   response. Nothing here is a real store, a real customer, or real
   revenue. Use it to demo the tools and the Claude Desktop flow.
 - LIVE: a real Shopify store, via the Shopify Admin REST API
-  (api_version 2025-01), when BOTH env vars are set:
+  (api_version 2025-01), when SHOPIFY_STORE_DOMAIN is set plus
+  EITHER a static token or the app's client credentials:
     SHOPIFY_STORE_DOMAIN = e.g. my-store.myshopify.com
     SHOPIFY_ADMIN_ACCESS_TOKEN = a custom-app Admin API access token
+      (static; Dev Dashboard tokens expire after ~24 hours), OR
+    SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET = the Dev Dashboard
+      app's credentials. With these, the server requests a fresh
+      access token itself (client credentials grant) and refreshes
+      it before it expires — this is the lasting live mode.
+      Client credentials win over a static token when both are set.
   with read_products, read_orders, read_inventory scopes.
-  The token lives only in the local Claude Desktop config env (or a
+  Credentials live only in the local Claude Desktop config env (or a
   private file on the PC, like the Yelp key) — never in chat, never
   in the repo, never in a screenshot.
 
@@ -32,6 +39,7 @@ Honest limits, stated in every tool that needs them:
   mode, only for that order, and are not stored by this server).
 """
 import os
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -42,19 +50,68 @@ mcp = FastMCP("shopify-store-ops")
 API_VERSION = "2025-01"
 STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "").strip()
 ACCESS_TOKEN = os.environ.get("SHOPIFY_ADMIN_ACCESS_TOKEN", "").strip()
-LIVE = bool(STORE_DOMAIN and ACCESS_TOKEN)
+CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "").strip()
+LIVE = bool(STORE_DOMAIN and (ACCESS_TOKEN or (CLIENT_ID and CLIENT_SECRET)))
 
-# This VM's egress proxy does TLS interception with a CA that lives in
-# the system bundle but not in certifi's. Use the system bundle, and
-# pass the proxy explicitly: httpx chokes parsing this shell's
-# no_proxy list. (Same pattern as the Transit + Restaurants servers.)
-_SYSTEM_CA = "/etc/ssl/certs/ca-certificates.crt"
+# Cached grant-flow token: {"token": str | None, "expires_at": float}.
+# Refreshed 60 seconds before expiry, so a long Claude Desktop
+# session never has to wait on a stale token.
+_token_cache = {"token": None, "expires_at": 0.0}
 
 
-def _client() -> httpx.Client:
+def _raw_client() -> httpx.Client:
+    """httpx client with no Shopify auth header (used for the token grant)."""
+    return httpx.Client(
+        proxy=os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY"),
+        trust_env=False,
+        verify=_SYSTEM_CA if os.path.exists(_SYSTEM_CA) else True,
+        headers={"User-Agent": "ShopifyStoreOpsMCP/1.0 (portfolio project)"},
+        timeout=20,
+    )
+
+
+def _get_access_token() -> str | None:
+    """Return a working Admin API access token, refreshing it if needed.
+
+    Client credentials win: the grant flow returns a fresh token that
+    lasts ~24 hours, cached until 60s before expiry. A static token
+    is used as-is when no client credentials are set.
+    Returns None when no token can be obtained (never raises).
+    """
+    if not (CLIENT_ID and CLIENT_SECRET):
+        return ACCESS_TOKEN or None
+    if _token_cache["token"] and time.time() < _token_cache["expires_at"]:
+        return _token_cache["token"]
+    url = f"https://{STORE_DOMAIN}/admin/oauth/access_token"
+    try:
+        with _raw_client() as client:
+            r = client.post(url, json={
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            })
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    token = data.get("access_token")
+    if not token:
+        return None
+    expires_in = int(data.get("expires_in") or 86399)
+    _token_cache["token"] = token
+    _token_cache["expires_at"] = time.time() + max(60, expires_in - 60)
+    return token
+
+
+def _client(token: str | None = None) -> httpx.Client:
     headers = {"User-Agent": "ShopifyStoreOpsMCP/1.0 (portfolio project)"}
-    if LIVE:
-        headers["X-Shopify-Access-Token"] = ACCESS_TOKEN
+    if token:
+        headers["X-Shopify-Access-Token"] = token
     return httpx.Client(
         proxy=os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY"),
         trust_env=False,
@@ -65,14 +122,29 @@ def _client() -> httpx.Client:
 
 
 def _live_get(path: str, params: dict | None = None) -> dict:
+    token = _get_access_token()
+    if not token:
+        return {"error": "Could not get a Shopify access token — check SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET (or SHOPIFY_ADMIN_ACCESS_TOKEN) and that the app is installed on the store."}
     url = f"https://{STORE_DOMAIN}/admin/api/{API_VERSION}/{path}"
     try:
-        with _client() as client:
+        with _client(token) as client:
             r = client.get(url, params=params or {})
     except Exception as e:
         return {"error": f"Shopify request failed: {e}"}
     if r.status_code == 401:
-        return {"error": "Shopify returned 401 — check SHOPIFY_ADMIN_ACCESS_TOKEN and its read scopes."}
+        # Token may have expired between cache check and call: clear
+        # the cache and retry once with a freshly granted token.
+        _token_cache["token"] = None
+        _token_cache["expires_at"] = 0.0
+        token = _get_access_token()
+        if token:
+            try:
+                with _client(token) as client:
+                    r = client.get(url, params=params or {})
+            except Exception as e:
+                return {"error": f"Shopify request failed: {e}"}
+        if r.status_code == 401:
+            return {"error": "Shopify returned 401 — check the app's read scopes (read_products, read_orders, read_inventory)."}
     if r.status_code == 404:
         return {"error": f"Shopify returned 404 for {path} — check SHOPIFY_STORE_DOMAIN."}
     if r.status_code == 429:
@@ -83,6 +155,12 @@ def _live_get(path: str, params: dict | None = None) -> dict:
         return r.json()
     except Exception:
         return {"error": "Shopify returned a response that was not JSON."}
+
+# This VM's egress proxy does TLS interception with a CA that lives in
+# the system bundle but not in certifi's. Use the system bundle, and
+# pass the proxy explicitly: httpx chokes parsing this shell's
+# no_proxy list. (Same pattern as the Transit + Restaurants servers.)
+_SYSTEM_CA = "/etc/ssl/certs/ca-certificates.crt"
 
 
 # ---------------------------------------------------------------- sample store
@@ -147,8 +225,9 @@ SAMPLE_ORDERS = [
 
 SAMPLE_NOTE = ("SAMPLE MODE — demo store 'Willow & Wick' (handmade candles / "
                "home goods). Not a real store, customer, or sale. Set "
-               "SHOPIFY_STORE_DOMAIN + SHOPIFY_ADMIN_ACCESS_TOKEN to use a "
-               "real Shopify store instead.")
+               "SHOPIFY_STORE_DOMAIN + SHOPIFY_CLIENT_ID + "
+               "SHOPIFY_CLIENT_SECRET (preferred, auto-refreshing) or "
+               "SHOPIFY_ADMIN_ACCESS_TOKEN to use a real Shopify store instead.")
 LIVE_NOTE = "LIVE MODE — data from the connected Shopify store, as returned by Shopify at call time."
 
 
